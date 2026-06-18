@@ -51,7 +51,7 @@ In Portainer, create a new stack and paste this:
 ```yaml
 services:
   playlistmanagerv2:
-    image: ghcr.io/YOUR_GITHUB_USERNAME/playlistmanager:latest
+    image: ghcr.io/n3o2345/playlistmanager:latest
     container_name: playlistmanagerv2
     restart: unless-stopped
     ports:
