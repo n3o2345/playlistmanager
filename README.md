@@ -77,7 +77,7 @@ docker run -d \
   --restart unless-stopped \
   -p 5523:5523 \
   -v playlistmanagerv2_data:/data \
-  ghcr.io/YOUR_GITHUB_USERNAME/playlistmanager:latest
+  ghcr.io/n3o2345/playlistmanager:latest
 ```
 
 Then open `http://localhost:5523/admin/`.
