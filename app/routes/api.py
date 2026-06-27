@@ -162,7 +162,7 @@ def _apply_channel_filters(q, filters: dict | None = None):
         elif gm == 'auto':
             q = q.filter(not_(or_(manual_mode, off_mode)))
     if filters.get('duplicates') in ('1', 'unique'):
-        exact_duplicate_names, possible_duplicate_names, gn_dup_ids = _duplicate_name_sets()
+        exact_duplicate_names, possible_duplicate_names, gn_dup_ids, _ = _duplicate_name_sets()
         all_duplicate_names = exact_duplicate_names | possible_duplicate_names
         if filters['duplicates'] == '1':
             q = q.filter(or_(Channel.name.in_(sorted(all_duplicate_names)), Channel.id.in_(gn_dup_ids), Channel.is_duplicate == True))
@@ -1899,7 +1899,7 @@ def clear_feed_channel_number(feed_id, channel_id):
 def duplicate_summary():
     """Return strict duplicate stats plus reviewable soft-match groups."""
     from collections import defaultdict
-    from .admin import _canonical_duplicate_name, _soft_duplicate_name
+    from .admin import _canonical_duplicate_name, _soft_duplicate_name, _verified_epg_duplicate_ids
 
     enabled_channels = (
         Channel.query.join(Source)
@@ -1929,16 +1929,22 @@ def duplicate_summary():
         countries = {ch.country for ch in channels}
         return len(countries) > 1
 
-    dup_channels = [
-        ch for channels in strict_groups.values()
-        if len(channels) > 1 and not _is_cross_region_only(channels)
-        for ch in channels
-    ]
+    verified_duplicate_ids = set()
+    for channels in strict_groups.values():
+        if len(channels) <= 1 or _is_cross_region_only(channels):
+            continue
+        group_verified_ids, _ = _verified_epg_duplicate_ids(channels)
+        verified_duplicate_ids.update(group_verified_ids)
+
+    dup_channels = [ch for channels in strict_groups.values() for ch in channels if ch.id in verified_duplicate_ids]
 
     if not dup_channels:
         strict_groups_found = set()
     else:
-        strict_groups_found = {key for key, channels in strict_groups.items() if len(channels) > 1}
+        strict_groups_found = {
+            key for key, channels in strict_groups.items()
+            if any(ch.id in verified_duplicate_ids for ch in channels)
+        }
 
     soft_group_payload = []
     for key, channels in soft_groups.items():
@@ -2005,7 +2011,7 @@ def duplicate_summary():
 def resolve_duplicates():
     """Disable duplicate channels, keeping one winner per normalized-name group."""
     from collections import defaultdict
-    from .admin import _canonical_duplicate_name, _soft_duplicate_name
+    from .admin import _canonical_duplicate_name, _soft_duplicate_name, _verified_epg_duplicate_ids
 
     data = request.get_json(force=True) or {}
     priority = data.get('source_priority', [])  # ordered list of source names, index 0 = highest
@@ -2072,6 +2078,10 @@ def resolve_duplicates():
         enabled_in_group = [ch for ch in channels if ch.is_enabled]
         if len(enabled_in_group) < 2:
             continue
+        verified_ids, _ = _verified_epg_duplicate_ids(enabled_in_group)
+        if len(verified_ids) < 2:
+            continue
+        channels = [ch for ch in channels if ch.id in verified_ids]
         channels.sort(key=priority_key)
         winner = channels[0]
         if all(is_unhealthy(ch) for ch in channels):

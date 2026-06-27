@@ -9,6 +9,7 @@ import signal
 import sys
 import threading
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -57,6 +58,33 @@ _setup_logfile()
 logger = logging.getLogger(__name__)
 _CHANNEL_MISS_THRESHOLD = 3
 _STALE_STARTED_JOB_GRACE_SECONDS = 300
+
+
+def _normalize_channel_name(name: str | None) -> str | None:
+    if not name:
+        return name
+    try:
+        name = name.encode('latin-1').decode('utf-8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+    normalized = unicodedata.normalize('NFKC', name)
+    replacements = {
+        '\u2018': "'",
+        '\u2019': "'",
+        '\u201c': '"',
+        '\u201d': '"',
+        '\u2013': '-',
+        '\u2014': '-',
+        '\xa0': ' ',
+    }
+    for old, new in replacements.items():
+        normalized = normalized.replace(old, new)
+    normalized = normalized.replace(',', '')
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    normalized = re.sub(r'\s+([:;!?])', r'\1', normalized)
+    normalized = re.sub(r'\s*/\s*', '/', normalized)
+    normalized = re.sub(r'\s*&\s*', ' & ', normalized)
+    return normalized or None
 
 flask_app = create_app()
 from app.config import VERSION as _VERSION
@@ -1247,7 +1275,7 @@ def _channel_ids_for_filters(filters: dict) -> list[int]:
             q = q.filter(not_(or_(manual_mode, off_mode)))
     if filters.get('duplicates') == '1':
         from app.routes.admin import _duplicate_name_sets
-        exact_duplicate_names, possible_duplicate_names, _ = _duplicate_name_sets()
+        exact_duplicate_names, possible_duplicate_names, _, _ = _duplicate_name_sets()
         all_duplicate_names = exact_duplicate_names | possible_duplicate_names
         q = q.filter(or_(Channel.name.in_(sorted(all_duplicate_names)), Channel.is_duplicate == True))
     return [row[0] for row in q.with_entities(Channel.id).all()]
@@ -1541,12 +1569,7 @@ def _upsert_channels(source, channel_data_list, gracenote_auto_fill: bool = True
     logo_validation_cache: dict[str, bool] = {}
     seen_at = datetime.now(timezone.utc)
     for cd in channel_data_list:
-        if cd.name:
-            try:
-                cd.name = cd.name.encode('latin-1').decode('utf-8')
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                pass
-            cd.name = cd.name.replace(',', '')
+        cd.name = _normalize_channel_name(cd.name)
         ch = existing.get(cd.source_channel_id)
 
         # Extract gracenote_id from ChannelData if the scraper set it directly,

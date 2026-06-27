@@ -622,93 +622,6 @@ def _make_pluto_seg_proxy_fn(source_name: str, channel_id: str = ''):
     return _proxy
 
 
-def _duplicate_failover_channel(channel: Channel) -> Channel | None:
-    """Find an enabled duplicate channel that can be used as playback fallback."""
-    from .admin import _canonical_duplicate_name
-    from ..models import Program
-    from datetime import datetime, timezone
-
-    name_key = _canonical_duplicate_name(channel.name or '')
-    gracenote_id = (channel.gracenote_id or '').strip()
-    if not name_key and not gracenote_id:
-        return None
-
-    rows = (
-        Channel.query
-        .join(Source)
-        .filter(
-            Channel.id != channel.id,
-            Channel.is_active == True,
-            Channel.is_enabled == True,
-            Source.is_enabled == True,
-            Source.epg_only == False,
-            Channel.stream_url != None,
-            db.or_(
-                Channel.disable_reason == None,
-                db.and_(
-                    Channel.disable_reason != 'Dead',
-                    ~Channel.disable_reason.like('DRM%'),
-                ),
-            ),
-        )
-        .all()
-    )
-    if not rows:
-        return None
-
-    now = datetime.now(timezone.utc)
-    channels_with_epg = {
-        row[0]
-        for row in db.session.query(Program.channel_id)
-        .filter(Program.end_time > now)
-        .distinct()
-        .all()
-    }
-
-    candidates = []
-    for candidate in rows:
-        candidate_gn = (candidate.gracenote_id or '').strip()
-        same_gn = bool(gracenote_id and candidate_gn == gracenote_id)
-        same_name = bool(name_key and _canonical_duplicate_name(candidate.name or '') == name_key)
-        if not same_gn and not same_name:
-            continue
-        candidates.append((
-            0 if same_gn else 1,
-            0 if same_name else 1,
-            0 if candidate.id in channels_with_epg else 1,
-            0 if candidate.source_id != channel.source_id else 1,
-            candidate.number or 999999,
-            candidate.name or '',
-            candidate,
-        ))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[:-1])
-    return candidates[0][-1]
-
-
-def _failover_redirect(channel: Channel, reason: str):
-    fallback = _duplicate_failover_channel(channel)
-    if not fallback:
-        return None
-    logger.warning(
-        '[play] failover %s/%s (%s) -> %s/%s (%s): %s',
-        channel.source.name if channel.source else '?',
-        channel.source_channel_id,
-        channel.name,
-        fallback.source.name if fallback.source else '?',
-        fallback.source_channel_id,
-        fallback.name,
-        reason,
-    )
-    return redirect(
-        f"{request.host_url.rstrip('/')}/play/{fallback.source.name}/{_quote(fallback.source_channel_id, safe='')}.m3u8",
-        302,
-    )
-
-
-
 @play_bp.route('/play/<source_name>/<channel_id>/proxy.m3u8')
 def hls_manifest_proxy(source_name: str, channel_id: str):
     """
@@ -728,23 +641,14 @@ def hls_manifest_proxy(source_name: str, channel_id: str):
     except Exception as e:
         logger.warning('[%s-proxy] resolve failed for %s: %s', source_name, channel_id, e)
         trigger_channel_auto_disable(channel.id, 'Dead')
-        failover = _failover_redirect(channel, 'proxy resolve failed')
-        if failover:
-            return failover
         abort(502)
     if not master_url or not master_url.startswith(('http://', 'https://')):
-        failover = _failover_redirect(channel, 'proxy missing resolved URL')
-        if failover:
-            return failover
         abort(502)
 
     try:
         master_r = _fetch_manifest(master_url, session)
     except Exception:
         trigger_channel_auto_disable(channel.id, 'Dead')
-        failover = _failover_redirect(channel, 'proxy manifest fetch failed')
-        if failover:
-            return failover
         raise
     effective_master_url = master_r.url
     text = master_r.text
@@ -799,23 +703,14 @@ def hls_variant_proxy(source_name: str, channel_id: str):
     except Exception as e:
         logger.warning('[%s-variant] resolve failed for %s: %s', source_name, channel_id, e)
         trigger_channel_auto_disable(channel.id, 'Dead')
-        failover = _failover_redirect(channel, 'variant resolve failed')
-        if failover:
-            return failover
         abort(502)
     if not master_url or not master_url.startswith(('http://', 'https://')):
-        failover = _failover_redirect(channel, 'variant missing resolved URL')
-        if failover:
-            return failover
         abort(502)
 
     try:
         master_r = _fetch_manifest(master_url, session)
     except Exception:
         trigger_channel_auto_disable(channel.id, 'Dead')
-        failover = _failover_redirect(channel, 'variant master fetch failed')
-        if failover:
-            return failover
         raise
     variants = _master_variants(master_r.text, master_r.url)
     variant_url = variants[min(index, len(variants) - 1)] if variants else master_r.url
@@ -823,9 +718,6 @@ def hls_variant_proxy(source_name: str, channel_id: str):
         variant_r = _fetch_manifest(variant_url, session)
     except Exception:
         trigger_channel_auto_disable(channel.id, 'Dead')
-        failover = _failover_redirect(channel, 'variant playlist fetch failed')
-        if failover:
-            return failover
         raise
 
     seg_proxy_fn = _make_pluto_seg_proxy_fn(source_name, channel.source_channel_id) if source_name == 'pluto' else None
@@ -870,9 +762,7 @@ def play(source_name: str, channel_id: str):
         or channel.disable_reason == 'Dead'
         or (channel.disable_reason or '').startswith('DRM')
     ):
-        failover = _failover_redirect(channel, channel.disable_reason or 'channel disabled')
-        if failover:
-            return failover
+        abort(410)
 
     if source_name in _MANIFEST_PROXY_SOURCES:
         encoded_id = _quote(channel.source_channel_id, safe='')
@@ -893,9 +783,6 @@ def play(source_name: str, channel_id: str):
                 client_ip, source_name, channel_id, channel.name, e,
             )
             trigger_channel_auto_disable(channel.id, 'Dead')
-            failover = _failover_redirect(channel, 'resolver confirmed dead')
-            if failover:
-                return failover
             resolved_url = None
         except Exception as e:
             logger.error(
@@ -917,9 +804,6 @@ def play(source_name: str, channel_id: str):
         resolved_url = channel.stream_url
 
     if not resolved_url or not resolved_url.startswith(('http://', 'https://')):
-        failover = _failover_redirect(channel, 'missing resolved URL')
-        if failover:
-            return failover
         abort(502)
 
     # STIRR channels resolve to URLs with IP-bound session tokens — proxy all
@@ -962,8 +846,7 @@ def play(source_name: str, channel_id: str):
             if not reason:
                 # Audio check: catch sources (e.g. TVPass) that serve a silent
                 # subscribe/paywall screen as valid HLS video with no audio track.
-                # If ffprobe finds zero audio streams, treat the channel as Dead
-                # so Dispatcharr failover kicks in on the next request.
+                # If ffprobe finds zero audio streams, treat the channel as Dead.
                 scraper_cls = registry.get(_source_name)
                 skip_audio_check = bool(
                     scraper_cls and getattr(scraper_cls, 'skip_audio_check', False)
@@ -971,7 +854,7 @@ def play(source_name: str, channel_id: str):
                 if not skip_audio_check and not _check_audio(resolved_url):
                     reason = 'Dead'
                     logger.warning(
-                        '[play] no audio track detected for %s/%s (%s) — marking Dead for failover',
+                        '[play] no audio track detected for %s/%s (%s) — marking Dead',
                         _source_name, _channel_id, resolved_url[:80],
                     )
             if not reason:

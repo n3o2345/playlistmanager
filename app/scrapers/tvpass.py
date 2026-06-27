@@ -175,13 +175,13 @@ class DirectM3UScraper(M3UScraper):
 
 
 class TVPassScraper(DirectM3UScraper):
-    """TVPass scraper with HD-first stream selection and audio-based failover.
+    """TVPass scraper with HD-first stream selection and audio validation.
 
     Play order on each request:
       1. Try HD stream — if audio is detected, serve it.
       2. If HD has no audio, try SD stream — if audio is detected, serve it.
-      3. If SD also has no audio, raise StreamDeadError so Dispatcharr can
-         trigger its own channel failover.
+      3. If SD also has no audio, raise StreamDeadError so the channel is
+         marked dead.
     """
     source_name = 'tvpass'
     source_aliases = ('tvpass_direct',)
@@ -205,7 +205,7 @@ class TVPassScraper(DirectM3UScraper):
         Always attempts HD first regardless of the configured quality preference,
         since HD is the highest-quality option. Only falls back to SD when HD
         produces a playlist with no audio. If SD also has no audio, raises
-        StreamDeadError so Dispatcharr can perform channel-level failover.
+        StreamDeadError so the channel can be marked dead.
         """
         # Build both quality variants for this URL
         hd_url = _LIVE_QUALITY_RE.sub(r'\g<1>hd', raw_url)

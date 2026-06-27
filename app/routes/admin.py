@@ -50,9 +50,47 @@ def _soft_duplicate_name(name: str) -> str:
     return s
 
 
-def _duplicate_name_sets() -> tuple[set[str], set[str], set[int]]:
-    name_rows = (
-        db.session.query(Channel.name, Channel.source_id, Channel.country)
+def _program_signature(title: str | None, start_time, end_time) -> tuple[str, str, str]:
+    title_key = _base_duplicate_name(title or '')
+    start_key = start_time.isoformat() if start_time else ''
+    end_key = end_time.isoformat() if end_time else ''
+    return title_key, start_key, end_key
+
+
+def _future_epg_signatures(channel_ids: list[int]) -> dict[int, set[tuple[str, str, str]]]:
+    if not channel_ids:
+        return {}
+    now = datetime.now(timezone.utc)
+    rows = (
+        db.session.query(Program.channel_id, Program.title, Program.start_time, Program.end_time)
+        .filter(Program.channel_id.in_(channel_ids), Program.end_time > now)
+        .order_by(Program.channel_id, Program.start_time)
+        .all()
+    )
+    signatures: dict[int, set[tuple[str, str, str]]] = defaultdict(set)
+    for channel_id, title, start_time, end_time in rows:
+        signatures[channel_id].add(_program_signature(title, start_time, end_time))
+    return signatures
+
+
+def _verified_epg_duplicate_ids(channels: list) -> tuple[set[int], set[int]]:
+    signatures = _future_epg_signatures([ch.id for ch in channels])
+    channels_with_epg = [ch for ch in channels if signatures.get(ch.id)]
+    no_epg_ids = {ch.id for ch in channels if not signatures.get(ch.id)}
+    duplicate_ids: set[int] = set()
+
+    for idx, left in enumerate(channels_with_epg):
+        left_sig = signatures.get(left.id, set())
+        for right in channels_with_epg[idx + 1:]:
+            if left_sig & signatures.get(right.id, set()):
+                duplicate_ids.update((left.id, right.id))
+
+    return duplicate_ids, no_epg_ids
+
+
+def _duplicate_name_sets() -> tuple[set[str], set[str], set[int], set[int]]:
+    channel_rows = (
+        Channel.query
         .filter(Channel.name != None, Channel.name != '')
         .all()
     )
@@ -60,36 +98,41 @@ def _duplicate_name_sets() -> tuple[set[str], set[str], set[int]]:
     strict_by_key: dict[str, list] = defaultdict(list)
     soft_by_key: dict[str, set[str]] = defaultdict(set)
 
-    for name, source_id, country in name_rows:
-        clean = (name or '').strip()
+    for ch in channel_rows:
+        clean = (ch.name or '').strip()
         if not clean:
             continue
         strict_key = _canonical_duplicate_name(clean)
         if strict_key:
-            strict_by_key[strict_key].append((clean, source_id, country))
+            strict_by_key[strict_key].append(ch)
         soft_key = _soft_duplicate_name(clean)
         if soft_key:
             soft_by_key[soft_key].add(clean)
 
     duplicate_names: set[str] = set()
     cross_region_names: set[str] = set()
+    no_epg_duplicate_ids: set[int] = set()
 
     for key, entries in strict_by_key.items():
         if len(entries) <= 1:
             continue
-        source_ids = {e[1] for e in entries}
+        source_ids = {ch.source_id for ch in entries}
         if len(source_ids) > 1:
             # Multiple sources → real duplicate regardless of region
-            duplicate_names.update(e[0] for e in entries)
+            verified_ids, no_epg_ids = _verified_epg_duplicate_ids(entries)
+            duplicate_names.update(ch.name for ch in entries if ch.id in verified_ids)
+            no_epg_duplicate_ids.update(no_epg_ids)
         else:
             # Single source — check if it's just the same channel in multiple regions
-            countries = {e[2] for e in entries}
+            countries = {ch.country for ch in entries}
             if len(countries) > 1:
                 # Same source, different regions → softer flag (DUP?)
-                cross_region_names.update(e[0] for e in entries)
+                cross_region_names.update(ch.name for ch in entries)
             else:
                 # Same source, same region → real duplicate
-                duplicate_names.update(e[0] for e in entries)
+                verified_ids, no_epg_ids = _verified_epg_duplicate_ids(entries)
+                duplicate_names.update(ch.name for ch in entries if ch.id in verified_ids)
+                no_epg_duplicate_ids.update(no_epg_ids)
 
     possible_names: set[str] = set()
     for names in soft_by_key.values():
@@ -120,7 +163,7 @@ def _duplicate_name_sets() -> tuple[set[str], set[str], set[int]]:
             if cname not in duplicate_names:
                 gn_duplicate_ids.add(cid)
 
-    return duplicate_names, possible_names, gn_duplicate_ids
+    return duplicate_names, possible_names, gn_duplicate_ids, no_epg_duplicate_ids
 
 
 def _page_source_chnum_map(page_items) -> dict[int, int]:
@@ -472,7 +515,7 @@ def channels():
     sort_by          = request.args.get('sort', 'name')
     sort_dir         = request.args.get('dir', 'asc')
 
-    exact_duplicate_names, possible_duplicate_names, gn_duplicate_ids = _duplicate_name_sets()
+    exact_duplicate_names, possible_duplicate_names, gn_duplicate_ids, no_epg_duplicate_ids = _duplicate_name_sets()
     all_duplicate_names = exact_duplicate_names | possible_duplicate_names
 
     q = Channel.query.join(Source)
@@ -659,6 +702,7 @@ def channels():
     duplicate_names = exact_duplicate_names & page_names
     possible_duplicate_names = possible_duplicate_names & page_names
     gn_duplicate_page_ids = gn_duplicate_ids & page_ids
+    no_epg_duplicate_page_ids = no_epg_duplicate_ids & page_ids
     duplicate_group_keys = {ch.id: _canonical_duplicate_name(ch.name or '') for ch in channels.items}
     chnum_map = _page_default_feed_chnum_map(channels.items)
 
@@ -725,6 +769,7 @@ def channels():
                            duplicate_names=duplicate_names,
                            possible_duplicate_names=possible_duplicate_names,
                            gn_duplicate_ids=gn_duplicate_page_ids,
+                           no_epg_duplicate_ids=no_epg_duplicate_page_ids,
                            duplicate_group_keys=duplicate_group_keys,
                            sort_by=sort_by, sort_dir=sort_dir,
                            chnum_map=chnum_map,
